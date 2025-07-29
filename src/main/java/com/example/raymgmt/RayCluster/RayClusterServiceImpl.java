@@ -4,100 +4,164 @@ import org.springframework.http.*;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
+import java.math.BigDecimal;
 import java.util.*;
 
 @Service
 public class RayClusterServiceImpl implements RayClusterService {
 
-    private final Map<String, RayClusterRequest> clusterStore = new HashMap<>(); // 임시 저장소
     private final RestTemplate restTemplate = new RestTemplate();
     private static final String K8S_API_URL = "http://your-k8s-api-endpoint/api/v1/raycluster";
 
-    // ✅ 클러스터 생성
+    private RayClusterRequest getClusterByRscId(String rscId) {
+        throw new UnsupportedOperationException("getClusterByRscId는 DB 연동 후 구현 필요");
+    }
+
     @Override
     public void createCluster(RayClusterBaseVO vo) {
+        if (!(vo instanceof RayClusterRequest)) throw new IllegalArgumentException("RayClusterRequest 타입 필요");
+
         RayClusterRequest request = (RayClusterRequest) vo;
-        clusterStore.put(request.getMetadata().get("name").toString(), request);
+        if ("approval".equalsIgnoreCase(request.getStatus())) {
+            deployToKubernetes(request);
+        }
     }
 
-    // ✅ 클러스터 목록 조회
     @Override
     public List<RayClusterBaseVO> getClusterList() {
-        return new ArrayList<>(clusterStore.values());
+        throw new UnsupportedOperationException("getClusterList는 DB 연동 후 구현 필요");
     }
 
-    // ✅ 단일 클러스터 조회
     @Override
     public RayClusterBaseVO getCluster(String name) {
-        return clusterStore.get(name);
+        throw new UnsupportedOperationException("getCluster는 DB 연동 후 구현 필요");
     }
 
-    // ✅ 기존 방식의 업데이트 (컨트롤러에서 BaseVO로 호출 시)
     @Override
-    public void updateCluster(String name, RayClusterBaseVO newVO) {
-        updateCluster(name, (RayClusterRequest) newVO);
+    public void updateCluster(String name, RayClusterBaseVO vo) {
+        updateCluster(name, (RayClusterRequest) vo);
     }
 
-    // ✅ 새 방식의 업데이트: 변경된 요청 받아 상태 결정 및 배포 처리
     @Override
     public RayClusterRequest updateCluster(String name, RayClusterRequest newVO) {
-        RayClusterRequest existing = clusterStore.get(name);
-        if (existing == null) {
-            throw new RuntimeException("Cluster not found: " + name);
-        }
-
+        RayClusterRequest existing = getClusterByRscId(newVO.getRscId());
         boolean needsApproval = isResourceIncreased(existing, newVO);
 
         if (needsApproval) {
             newVO.setStatus("request");
         } else {
             newVO.setStatus("approval");
-            deployToKubernetes(newVO); // 자동 배포
+            deployToKubernetes(newVO);
         }
 
-        clusterStore.put(name, newVO);
         return newVO;
     }
 
-    // ✅ 클러스터 삭제
     @Override
     public void deleteCluster(String name) {
-        clusterStore.remove(name);
+        throw new UnsupportedOperationException("deleteCluster는 DB 연동 후 구현 필요");
     }
 
-    // ✅ 리소스 증가 여부 판단 (limits.cpu 또는 memory 증가 시 true)
     @Override
     public boolean isResourceIncreased(RayClusterRequest oldVO, RayClusterRequest newVO) {
-        Map<String, Object> oldSpec = oldVO.getSpec();
-        Map<String, Object> newSpec = newVO.getSpec();
-
         try {
-            Map<String, Object> oldHead = (Map<String, Object>) oldSpec.get("headGroupSpec");
-            Map<String, Object> newHead = (Map<String, Object>) newSpec.get("headGroupSpec");
+            Map<String, Object> oldSpec = oldVO.getSpec();
+            Map<String, Object> newSpec = newVO.getSpec();
 
-            List<Map<String, Object>> oldContainers = (List<Map<String, Object>>) oldHead.get("containers");
-            List<Map<String, Object>> newContainers = (List<Map<String, Object>>) newHead.get("containers");
+            // ✅ HeadGroup 비교
+            boolean headIncreased = compareGroupSpec(
+                    (Map<String, Object>) oldSpec.get("headGroupSpec"),
+                    (Map<String, Object>) newSpec.get("headGroupSpec")
+            );
 
-            Map<String, Object> oldResources = (Map<String, Object>) oldContainers.get(0).get("resources");
-            Map<String, Object> newResources = (Map<String, Object>) newContainers.get(0).get("resources");
+            // ✅ WorkerGroups 비교
+            List<Map<String, Object>> oldWorkers = (List<Map<String, Object>>) oldSpec.get("workerGroupSpecs");
+            List<Map<String, Object>> newWorkers = (List<Map<String, Object>>) newSpec.get("workerGroupSpecs");
 
-            Map<String, String> oldLimits = (Map<String, String>) oldResources.get("limits");
-            Map<String, String> newLimits = (Map<String, String>) newResources.get("limits");
+            boolean workerIncreased = false;
+            if (oldWorkers != null && newWorkers != null) {
+                for (int i = 0; i < Math.min(oldWorkers.size(), newWorkers.size()); i++) {
+                    if (compareGroupSpec(oldWorkers.get(i), newWorkers.get(i))) {
+                        workerIncreased = true;
+                        break;
+                    }
+                }
+            }
 
-            return isIncreased(oldLimits.get("cpu"), newLimits.get("cpu")) ||
-                    isIncreased(oldLimits.get("memory"), newLimits.get("memory"));
+            return headIncreased || workerIncreased;
 
         } catch (Exception e) {
             throw new RuntimeException("자원 비교 실패: " + e.getMessage());
         }
     }
 
-    private boolean isIncreased(String oldVal, String newVal) {
-        if (oldVal == null || newVal == null) return false;
-        return !oldVal.equals(newVal); // 향후 단위 변환 비교 가능
+    private boolean compareGroupSpec(Map<String, Object> oldGroup, Map<String, Object> newGroup) {
+        List<Map<String, Object>> oldContainers = (List<Map<String, Object>>) oldGroup.get("containers");
+        List<Map<String, Object>> newContainers = (List<Map<String, Object>>) newGroup.get("containers");
+
+        if (oldContainers == null || newContainers == null) return false;
+
+        for (int i = 0; i < Math.min(oldContainers.size(), newContainers.size()); i++) {
+            Map<String, Object> oldResources = (Map<String, Object>) oldContainers.get(i).get("resources");
+            Map<String, Object> newResources = (Map<String, Object>) newContainers.get(i).get("resources");
+
+            if (oldResources == null || newResources == null) continue;
+
+            Map<String, String> oldLimits = (Map<String, String>) oldResources.get("limits");
+            Map<String, String> newLimits = (Map<String, String>) newResources.get("limits");
+
+            Map<String, String> newRequests = (Map<String, String>) newResources.get("requests");
+
+            if (isIncreased(oldLimits.get("cpu"), newLimits.get("cpu")) ||
+                    isIncreased(oldLimits.get("memory"), newLimits.get("memory"))) {
+                return true;
+            }
+
+            if (!isRequestsWithinLimits(newRequests, newLimits)) {
+                throw new RuntimeException("❌ 요청한 requests 값이 limits를 초과합니다.");
+            }
+        }
+
+        return false;
     }
 
-    // ✅ Webhook 호출 (status=approval인 경우 K8s API 호출)
+    private boolean isRequestsWithinLimits(Map<String, String> requests, Map<String, String> limits) {
+        if (requests == null || limits == null) return true;
+
+        BigDecimal reqCpu = parseResourceValue(requests.get("cpu"));
+        BigDecimal limCpu = parseResourceValue(limits.get("cpu"));
+
+        BigDecimal reqMem = parseResourceValue(requests.get("memory"));
+        BigDecimal limMem = parseResourceValue(limits.get("memory"));
+
+        return reqCpu.compareTo(limCpu) <= 0 && reqMem.compareTo(limMem) <= 0;
+    }
+
+    private boolean isIncreased(String oldVal, String newVal) {
+        if (oldVal == null || newVal == null) return false;
+
+        try {
+            BigDecimal oldNum = parseResourceValue(oldVal);
+            BigDecimal newNum = parseResourceValue(newVal);
+            return newNum.compareTo(oldNum) > 0;
+        } catch (Exception e) {
+            return !oldVal.equals(newVal);
+        }
+    }
+
+    private BigDecimal parseResourceValue(String value) {
+        if (value == null) return BigDecimal.ZERO;
+        if (value.endsWith("m")) {
+            return new BigDecimal(value.replace("m", "")).divide(BigDecimal.valueOf(1000));
+        } else if (value.endsWith("Gi")) {
+            return new BigDecimal(value.replace("Gi", "")).multiply(BigDecimal.valueOf(1024));
+        } else if (value.endsWith("Mi")) {
+            return new BigDecimal(value.replace("Mi", ""));
+        } else {
+            return new BigDecimal(value);
+        }
+    }
+
     @Override
     public boolean deployToKubernetes(RayClusterRequest vo) {
         try {
